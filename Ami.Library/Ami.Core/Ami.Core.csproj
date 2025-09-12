@@ -1,0 +1,18 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<!-- Authored by Dakota Mihelich -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>12.0</LangVersion>
+    <PackageId>Ami.Core</PackageId>
+    <Description>Core services, parsing logic, and DI extensions for the Author Manuscript Indexer (AMI) library.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="System.Text.Json" Version="9.0.9" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Ami.Core.Abstractions\Ami.Core.Abstractions.csproj" />
+  </ItemGroup>
+</Project>

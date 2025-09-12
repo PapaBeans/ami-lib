@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<!-- Authored by Dakota Mihelich -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>12.0</LangVersion>
+    <PackageId>Ami.Storage.Sqlite</PackageId>
+    <Description>SQLite storage provider for the Author Manuscript Indexer (AMI) library.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.4" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.1" />
+    <PackageReference Include="System.Text.Json" Version="9.0.9" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Ami.Core.Abstractions\Ami.Core.Abstractions.csproj" />
+    <ProjectReference Include="..\Ami.Core\Ami.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,18 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<!-- Authored by Dakota Mihelich -->
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFramework>net8.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="Spectre.Console" Version="0.48.0" />
+		<PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+	</ItemGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\Ami.Core.Abstractions\Ami.Core.Abstractions.csproj" />
+		<ProjectReference Include="..\Ami.Core\Ami.Core.csproj" />
+		<ProjectReference Include="..\Ami.Storage.Sqlite\Ami.Storage.Sqlite.csproj" />
+	</ItemGroup>
+</Project>
