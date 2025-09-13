@@ -8,6 +8,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Spectre.Console;
+using Serilog;
+using System.Diagnostics;
 
 #region Main Application Loop
 // --- Configuration ---
@@ -16,6 +18,7 @@ var dbPath = "ami.cli.db";
 // --- Create DI Host ---
 using var host = CreateHost(dbPath);
 AnsiConsole.MarkupLine($"[bold green]Database initialized at:[/] [dim]{Path.GetFullPath(dbPath)}[/]");
+AnsiConsole.MarkupLine($"[bold yellow]Verbose logs are being written to:[/] [dim]ami-cli-log.txt[/]");
 
 // --- Main Menu Loop ---
 var keepRunning = true;
@@ -73,9 +76,8 @@ AnsiConsole.MarkupLine("[bold blue]Goodbye![/]");
 async Task HandleIndexAsync(IServiceProvider services)
 {
     var indexService = services.GetRequiredService<IAmiIndexService>();
+    var logger = services.GetRequiredService<ILogger<Program>>();
 
-    // *** THIS IS THE CORRECTED LINE ***
-    // The invalid style '[_]' has been removed and replaced with a simple colon.
     var path = AnsiConsole.Prompt(
         new TextPrompt<string>("[yellow]Enter the path to the manuscript directory:[/] ")
             .Validate(p => Directory.Exists(p) ? ValidationResult.Success() : ValidationResult.Error("[red]Directory does not exist[/]")));
@@ -95,17 +97,35 @@ async Task HandleIndexAsync(IServiceProvider services)
 
     try
     {
+        var stopwatch = Stopwatch.StartNew();
+        var indexingTask = indexService.IndexAsync(files, options);
+
         await AnsiConsole.Status()
-            .StartAsync($"[yellow]Indexing {files.Length} files...[/]", async ctx =>
+            .StartAsync($"[yellow]Indexing...[/]", async ctx =>
             {
-                await indexService.IndexAsync(files, options);
+                // This internal loop updates the status text with elapsed time
+                // while the main indexing task is running
+                while (!indexingTask.IsCompleted)
+                {
+                    ctx.Status($"[yellow]Indexing {files.Length} files... ({stopwatch.Elapsed:m\\:ss})[/]");
+                    ctx.Refresh();
+                    await Task.Delay(500);
+                }
             });
-        AnsiConsole.MarkupLine("[bold green]? Indexing completed successfully.[/]");
+        await indexingTask;
+        stopwatch.Stop();
+
+        AnsiConsole.MarkupLine($"[bold green] Indexing completed successfully in {stopwatch.Elapsed:g}.[/]");
     }
     catch (Exception ex)
     {
+        // Log the full, verbose exception to the log file
+        logger.LogError(ex, "A critical error occurred during the indexing operation.");
+
+        //Show a user friendly message in the console
         AnsiConsole.MarkupLine("[bold red]An error occurred during indexing:[/]");
-        AnsiConsole.WriteException(ex, ExceptionFormats.ShortenPaths);
+        AnsiConsole.MarkupLine("[red]See the ami0cli-log.txt file for complete details.[/]");
+        AnsiConsole.WriteException(ex, ExceptionFormats.ShortenTypes | ExceptionFormats.ShortenPaths);
     }
 }
 
@@ -113,7 +133,7 @@ async Task HandleResolveAsync(IServiceProvider services)
 {
     var resolveService = services.GetRequiredService<IAmiResolveService>();
 
-    var manuscriptId = AnsiConsole.Ask<string>("[yellow]Enter the Manuscript ID (e.g., PA_2_0_0):[/]");
+    var manuscriptId = AnsiConsole.Ask<string>("[yellow]Enter the Manuscript ID (e.g., Manuscript_Data_1_0_0_0):[/]");
     var key = AnsiConsole.Ask<string>("[yellow]Enter the Key to resolve (e.g., Policy.Surcharge):[/]");
 
     ResolvedValue? result = null;
@@ -214,7 +234,14 @@ async Task HandleSearchAsync(IServiceProvider services)
 IHost CreateHost(string dbPath)
 {
     return Host.CreateDefaultBuilder()
-        .ConfigureLogging(logging => logging.ClearProviders().AddConsole().SetMinimumLevel(LogLevel.Warning))
+        .UseSerilog((context, services, configuration) => configuration
+        .WriteTo.File(
+                "ami-cli-log.txt",
+                rollingInterval: RollingInterval.Day,
+                retainedFileCountLimit: 7,
+                outputTemplate: "{Timestamp:yyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}{Exception}"
+            )
+        )
         .ConfigureServices((_, services) =>
         {
             services.AddAmiSqliteStorage(sqlite =>

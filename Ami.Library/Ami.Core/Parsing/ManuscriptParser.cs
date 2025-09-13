@@ -21,7 +21,7 @@ public static class ManuscriptParser
 
         if (string.IsNullOrEmpty(header.Id))
         {
-            throw new ManuscriptConfigurationException($"Manuscript is missing required 'manuscriptId' attribute.", path);
+            throw new ManuscriptConfigurationException($"Manuscript is missing required 'manuscriptID' attribute. {0}", path);
         }
 
         var manuscript = new Manuscript(
@@ -185,7 +185,7 @@ public static class ManuscriptParser
 
     private static ManuscriptHeader ReadHeaderAttributes(XmlReader reader)
     {
-        string? id = reader.GetAttribute("manuscriptId");
+        string? id = reader.GetAttribute("manuscriptID");
         string? name = reader.GetAttribute("name");
         string? parentId = reader.GetAttribute("inherited");
         string? version = reader.GetAttribute("version");

@@ -1,9 +1,10 @@
-using System.Collections.Concurrent;
-using System.Diagnostics;
 using Ami.Core.Abstractions;
 using Ami.Core.Model;
 using Ami.Core.Parsing;
 using Ami.Core.Util;
+using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices.Marshalling;
 using Microsoft.Extensions.Logging;
 
 namespace Ami.Core.Services;
@@ -12,6 +13,8 @@ public class IndexService : IAmiIndexService
 {
     private readonly IAmiRepository _repository;
     private readonly ILogger<IndexService> _logger;
+    private static bool IsCopy(string? name) =>
+                        name?.TrimEnd().EndsWith("- Copy", StringComparison.OrdinalIgnoreCase) == true;
 
     public IndexService(IAmiRepository repository, ILogger<IndexService> logger)
     {
@@ -35,7 +38,14 @@ public class IndexService : IAmiIndexService
 
             var headerTasks = pathList.Select(p => ManuscriptParser.ParseAsync(p, options.Analyzers, normalizer, ct));
             var parseResults = await Task.WhenAll(headerTasks);
-            var manuscriptMap = parseResults.ToDictionary(r => r.Item1.Id, r => r.Item1);
+            var manuscriptMap = parseResults
+            .Select(r => r.Item1)
+            .Where(m => m != null && m!.Id != null)
+            .GroupBy(m => m!.Id, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                g => g.Key,
+                g => g.FirstOrDefault(m => !IsCopy(m!.Name)) ?? g.First()!, // Prefer original over names with "- Copy"
+                StringComparer.OrdinalIgnoreCase);
 
             var manuscriptsWithDepth = ComputeDepths(manuscriptMap);
 

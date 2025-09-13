@@ -1,3 +1,4 @@
+
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
@@ -14,6 +15,7 @@ public sealed class SqliteRepository : IAmiRepository
     public string ConnectionString { get; }
     private readonly bool _enableFts5;
     private readonly ILogger<SqliteRepository> _logger;
+    private static readonly SemaphoreSlim _nodeWriteGate = new(1, 1);
 
     public SqliteRepository(string databasePath, bool enableFts5, ILogger<SqliteRepository> logger)
     {
@@ -47,45 +49,71 @@ public sealed class SqliteRepository : IAmiRepository
 
         await using var db = CreateConnection();
         await db.OpenAsync(ct);
+
         await using var tx = db.BeginTransaction();
 
-        var upsertCmd = db.CreateCommand();
+        // Normalize early
+        var normalizedParentId = string.IsNullOrWhiteSpace(m.ParentId) ? null : m.ParentId.Trim();
+
+        // Check parent existence only when non-null/non-empty
+        bool parentExists = false;
+        if (normalizedParentId != null)
+        {
+            await using var checkParentCmd = db.CreateCommand();
+            checkParentCmd.Transaction = tx;
+            checkParentCmd.CommandText = "SELECT 1 FROM manuscripts WHERE id = $pid LIMIT 1;";
+            checkParentCmd.Parameters.AddWithValue("$pid", normalizedParentId);
+            parentExists = (await checkParentCmd.ExecuteScalarAsync(ct)) != null;
+        }
+
+        // Build upsert and always bind ALL params
+        await using var upsertCmd = db.CreateCommand();
         upsertCmd.Transaction = tx;
         upsertCmd.CommandText = @"
-            INSERT INTO manuscripts (id, name, path, parent_id, depth, size_bytes, mtime_utc, sha256, version, properties)
-            VALUES ($id, $name, $path, $parent_id, $depth, $size, $mtime, $sha256, $version, $props)
-            ON CONFLICT(id) DO UPDATE SET
-                name=excluded.name, path=excluded.path, parent_id=excluded.parent_id, depth=excluded.depth,
-                size_bytes=excluded.size_bytes, mtime_utc=excluded.mtime_utc, sha256=excluded.sha256,
-                version=excluded.version, properties=excluded.properties;
-        ";
+    INSERT INTO manuscripts (id, name, path, parent_id, depth, size_bytes, mtime_utc, sha256, version, properties)
+    VALUES ($id, $name, $path, $parent_id, $depth, $size, $mtime, $sha256, $version, $props)
+    ON CONFLICT(id) DO UPDATE SET
+        name=excluded.name,
+        path=excluded.path,
+        parent_id=excluded.parent_id,
+        depth=excluded.depth,
+        size_bytes=excluded.size_bytes,
+        mtime_utc=excluded.mtime_utc,
+        sha256=excluded.sha256,
+        version=excluded.version,
+        properties=excluded.properties;
+";
+
+        // Add parameters (use your AddManuscriptParameters, but pass normalizedParentId)
         AddManuscriptParameters(upsertCmd, m);
+
+        // IMPORTANT: override $parent_id to NULL when missing OR when parent doesn't exist yet
+        upsertCmd.Parameters["$parent_id"].Value =
+            (object?)(parentExists ? normalizedParentId : null) ?? DBNull.Value;
+
         await upsertCmd.ExecuteNonQueryAsync(ct);
 
-        if (m.ParentId != null)
+        // Only enqueue unresolved when we actually have a non-empty parent that wasn't found
+        if (normalizedParentId != null && !parentExists)
         {
-            var checkParentCmd = db.CreateCommand();
-            checkParentCmd.Transaction = tx;
-            checkParentCmd.CommandText = "SELECT 1 FROM manuscripts WHERE id = $parent_id;";
-            checkParentCmd.Parameters.AddWithValue("$parent_id", m.ParentId);
-            var parentExists = await checkParentCmd.ExecuteScalarAsync(ct) != null;
+            _logger.LogWarning("Manuscript {ChildId} declared a parent '{ParentId}' which does not exist yet. Adding to unresolved queue.",
+                               m.Id, normalizedParentId);
 
-            if (!parentExists)
-            {
-                _logger.LogWarning("Manuscript {ChildId} declared a parent {ParentId} which does not exist yet. Adding to unresolved queue.", m.Id, m.ParentId);
-                var unresolvedCmd = db.CreateCommand();
-                unresolvedCmd.Transaction = tx;
-                unresolvedCmd.CommandText = @"
-                    INSERT INTO unresolved_parents (child_id, declared_parent_id, created_utc)
-                    VALUES ($child_id, $parent_id, $now)
-                    ON CONFLICT(child_id) DO UPDATE SET declared_parent_id=excluded.declared_parent_id;
-                ";
-                unresolvedCmd.Parameters.AddWithValue("$child_id", m.Id);
-                unresolvedCmd.Parameters.AddWithValue("$parent_id", m.ParentId);
-                unresolvedCmd.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("o"));
-                await unresolvedCmd.ExecuteNonQueryAsync(ct);
-            }
+            await using var unresolvedCmd = db.CreateCommand();
+            unresolvedCmd.Transaction = tx;
+            unresolvedCmd.CommandText = @"
+        INSERT INTO unresolved_parents (child_id, declared_parent_id, created_utc)
+        VALUES ($child_id, $parent_id, $now)
+        ON CONFLICT(child_id) DO UPDATE SET declared_parent_id=excluded.declared_parent_id,
+                                            created_utc=excluded.created_utc;
+    ";
+            unresolvedCmd.Parameters.AddWithValue("$child_id", m.Id);
+            unresolvedCmd.Parameters.AddWithValue("$parent_id", normalizedParentId);
+            unresolvedCmd.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("o"));
+            await unresolvedCmd.ExecuteNonQueryAsync(ct);
         }
+
+
 
         var healCmd = db.CreateCommand();
         healCmd.Transaction = tx;
@@ -109,8 +137,8 @@ public sealed class SqliteRepository : IAmiRepository
 
         await tx.CommitAsync(ct);
     }
-
-    public async Task BulkReplaceNodesAsync(string manuscriptId, IAsyncEnumerable<NodeRecord> nodes, CancellationToken ct)
+    
+    public async Task BulkReplaceNodesAsync_old(string manuscriptId, IAsyncEnumerable<NodeRecord> nodes, CancellationToken ct)
     {
         using var activity = AmiInstrumentation.Source.StartActivity("BulkReplaceNodes");
         activity?.SetTag("ami.manuscript.id", manuscriptId);
@@ -172,23 +200,127 @@ public sealed class SqliteRepository : IAmiRepository
         _logger.LogDebug("Replaced {NodeCount} nodes for manuscript {ManuscriptId}.", insertedCount, manuscriptId);
     }
 
-    // ... The rest of the methods are unchanged ...
-    public async Task<IReadOnlyList<Manuscript>> ListManuscriptsAsync(CancellationToken ct = default)
+
+    public async Task BulkReplaceNodesAsync(string manuscriptId, IAsyncEnumerable<NodeRecord> nodes, CancellationToken ct)
     {
-        await using var db = CreateConnection();
-        await db.OpenAsync(ct);
+        using var activity = AmiInstrumentation.Source.StartActivity("BulkReplaceNodes");
+        activity?.SetTag("ami.manuscript.id", manuscriptId);
 
-        var cmd = db.CreateCommand();
-        cmd.CommandText = "SELECT id, name, path, parent_id, depth, size_bytes, mtime_utc, sha256, version, properties FROM manuscripts;";
-
-        var results = new List<Manuscript>();
-        await using var reader = await cmd.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
+        // Ensure only one writer touches `nodes` at a time
+        await _nodeWriteGate.WaitAsync(ct);
+        try
         {
-            results.Add(MapReaderToManuscript(reader));
+            await using var db = CreateConnection();
+            await db.OpenAsync(ct);
+
+            // Pragmas to reduce lock failures and improve throughput
+            await using (var pragmas = db.CreateCommand())
+            {
+                pragmas.CommandText = @"
+                    PRAGMA journal_mode = WAL;
+                    PRAGMA synchronous = NORMAL;
+                    PRAGMA busy_timeout = 5000; -- wait up to 5s for locks
+                ";
+                await pragmas.ExecuteNonQueryAsync(ct);
+            }
+
+            // Begin a transaction for delete+insert batch
+            await using var tx = db.BeginTransaction();
+
+            // 1) Delete existing nodes for this manuscript
+            await using (var deleteCmd = db.CreateCommand())
+            {
+                deleteCmd.Transaction = tx;
+                deleteCmd.CommandText = "DELETE FROM nodes WHERE manuscript_id = $id;";
+                deleteCmd.Parameters.AddWithValue("$id", manuscriptId);
+                await deleteCmd.ExecuteNonQueryAsync(ct);
+            }
+
+            // 2) Insert new nodes using a prepared statement
+            await using (var insertCmd = db.CreateCommand())
+            {
+                insertCmd.Transaction = tx;
+                insertCmd.CommandText = @"
+                    INSERT INTO nodes (
+                        manuscript_id, node_type, key, group_name, field_name, object_name,
+                        value_text, value_xml, value_attrs, attributes, value_analysis,
+                        line, column
+                    )
+                    VALUES (
+                        $mid, $type, $key, $group, $field, $object,
+                        $vtext, $vxml, $vattrs, $attrs, $vanalysis,
+                        $line, $col
+                    );
+                ";
+
+                insertCmd.Parameters.Add("$mid", SqliteType.Text).Value = manuscriptId;
+                var pType = insertCmd.Parameters.Add("$type", SqliteType.Text);
+                var pKey = insertCmd.Parameters.Add("$key", SqliteType.Text);
+                var pGroup = insertCmd.Parameters.Add("$group", SqliteType.Text);
+                var pField = insertCmd.Parameters.Add("$field", SqliteType.Text);
+                var pObject = insertCmd.Parameters.Add("$object", SqliteType.Text);
+                var pVText = insertCmd.Parameters.Add("$vtext", SqliteType.Text);
+                var pVXml = insertCmd.Parameters.Add("$vxml", SqliteType.Text);
+                var pVAttrs = insertCmd.Parameters.Add("$vattrs", SqliteType.Text);
+                var pAttrs = insertCmd.Parameters.Add("$attrs", SqliteType.Text);
+                var pVAnalysis = insertCmd.Parameters.Add("$vanalysis", SqliteType.Text);
+                var pLine = insertCmd.Parameters.Add("$line", SqliteType.Integer);
+                var pCol = insertCmd.Parameters.Add("$col", SqliteType.Integer);
+
+                await insertCmd.PrepareAsync(ct);
+
+                long insertedCount = 0;
+
+                await foreach (var node in nodes.WithCancellation(ct))
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    pType.Value = (object?)node.NodeType ?? DBNull.Value;
+                    pKey.Value = (object?)node.Key ?? DBNull.Value;
+                    pGroup.Value = (object?)node.GroupName ?? DBNull.Value;
+                    pField.Value = (object?)node.FieldName ?? DBNull.Value;
+                    pObject.Value = (object?)node.ObjectName ?? DBNull.Value;
+                    pVText.Value = (object?)node.ValueText ?? DBNull.Value;
+                    pVXml.Value = (object?)node.ValueXml ?? DBNull.Value;
+                    pVAttrs.Value = (object?)node.ValueAttrsJson ?? DBNull.Value;
+                    pAttrs.Value = (object?)node.AttributesJson ?? DBNull.Value;
+                    pVAnalysis.Value = (object?)node.ValueAnalysisJson ?? DBNull.Value;
+                    pLine.Value = node.Line.HasValue ? node.Line.Value : (object)DBNull.Value;
+                    pCol.Value = node.Column.HasValue ? node.Column.Value : (object)DBNull.Value;
+
+                    await insertCmd.ExecuteNonQueryAsync(ct);
+                    insertedCount++;
+                }
+
+                await tx.CommitAsync(ct);
+
+                AmiInstrumentation.NodesInserted.Add(insertedCount);
+                activity?.SetTag("ami.nodes.inserted", insertedCount);
+                _logger.LogDebug("Replaced {NodeCount} nodes for manuscript {ManuscriptId}.", insertedCount, manuscriptId);
+            }
         }
-        return results;
+        finally
+        {
+            _nodeWriteGate.Release();
+        }
     }
+
+    public async Task<IReadOnlyList<Manuscript>> ListManuscriptsAsync(CancellationToken ct = default)
+        {
+            await using var db = CreateConnection();
+            await db.OpenAsync(ct);
+
+            var cmd = db.CreateCommand();
+            cmd.CommandText = "SELECT id, name, path, parent_id, depth, size_bytes, mtime_utc, sha256, version, properties FROM manuscripts;";
+
+            var results = new List<Manuscript>();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                results.Add(MapReaderToManuscript(reader));
+            }
+            return results;
+        }
 
     public async Task<ResolvedValue?> ResolveAsync(string manuscriptId, string key, CancellationToken ct)
     {
@@ -340,18 +472,39 @@ public sealed class SqliteRepository : IAmiRepository
         return results;
     }
 
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        WriteIndented = false,
+        // Optional preferences:
+        // PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        // DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
     private static void AddManuscriptParameters(SqliteCommand cmd, Manuscript m)
     {
-        cmd.Parameters.AddWithValue("$id", m.Id);
-        cmd.Parameters.AddWithValue("$name", m.Name);
-        cmd.Parameters.AddWithValue("$path", m.Path);
-        cmd.Parameters.AddWithValue("$parent_id", (object?)m.ParentId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$depth", m.Depth);
-        cmd.Parameters.AddWithValue("$size", m.SizeBytes);
-        cmd.Parameters.AddWithValue("$mtime", m.MtimeUtc.ToString("o"));
-        cmd.Parameters.AddWithValue("$sha256", m.Sha256);
-        cmd.Parameters.AddWithValue("$version", (object?)m.Version ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$props", m.Properties != null ? JsonSerializer.Serialize(m.Properties) : DBNull.Value);
+        cmd.Parameters.Clear();
+        // Required / non-nullables
+        cmd.Parameters.Add("$id", SqliteType.Text).Value = m.Id;                                 // TEXT PK
+        cmd.Parameters.Add("$name", SqliteType.Text).Value = m.Name ?? string.Empty;             // TEXT
+        cmd.Parameters.Add("$path", SqliteType.Text).Value = m.Path ?? string.Empty;             // TEXT
+        cmd.Parameters.Add("$depth", SqliteType.Integer).Value = m.Depth;                        // INTEGER
+        cmd.Parameters.Add("$version", SqliteType.Integer).Value = m.Version;                    // INTEGER
+
+        // Parent: write NULL when missing/blank
+        var parentValue = string.IsNullOrWhiteSpace(m.ParentId) ? (object)DBNull.Value : m.ParentId!.Trim();
+        cmd.Parameters.Add("$parent_id", SqliteType.Text).Value = parentValue;
+
+        // Optional fields: use DBNull.Value when missing
+        cmd.Parameters.Add("$size", SqliteType.Integer).Value = (object?)m.SizeBytes ?? DBNull.Value;                    // INTEGER
+        cmd.Parameters.Add("$mtime", SqliteType.Text).Value = (object?)m.MtimeUtc ?? DBNull.Value;                       // ISO-8601 TEXT
+        cmd.Parameters.Add("$sha256", SqliteType.Text).Value = (object?)m.Sha256 ?? DBNull.Value;                        // TEXT
+
+        string? propsJson = null;
+        if (m.Properties is not null)
+            propsJson = JsonSerializer.Serialize(m.Properties, JsonOpts);
+
+        cmd.Parameters.Add("$props", SqliteType.Text).Value = (object?)propsJson ?? DBNull.Value;
+
     }
 
     private static Node MapReaderToNode(SqliteDataReader reader) => new(

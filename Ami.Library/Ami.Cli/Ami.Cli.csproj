@@ -9,6 +9,8 @@
 	<ItemGroup>
 		<PackageReference Include="Spectre.Console" Version="0.48.0" />
 		<PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
+		<PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
+		<PackageReference Include="Serilog.Sinks.File" Version="5.0.0" />
 	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\Ami.Core.Abstractions\Ami.Core.Abstractions.csproj" />

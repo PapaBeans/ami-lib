@@ -13,7 +13,7 @@ public class DefaultFieldNormalizer : IFieldNormalizer
         }
 
         string? group = currentObjectId;
-        string? field = fieldAttrs.GetValueOrDefault("id");
+        string? field = fieldAttrs.GetValueOrDefault("id")?.Split('.').Last(); //@id is already {Group}.{Field} so we only want the last element
 
         if (string.IsNullOrWhiteSpace(group) || string.IsNullOrWhiteSpace(field))
         {
